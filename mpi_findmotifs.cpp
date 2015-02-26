@@ -3,6 +3,7 @@
 #include "hamming.h"
 #include <mpi.h>
 #include <deque>
+#include <stdlib.h>
 
 const MPI_Comm COM = MPI_COMM_WORLD;
 const int MASTER = 0;
@@ -67,6 +68,7 @@ std::vector<bits_t> findmotifs_worker(const unsigned int n,
 {
     std::vector<bits_t> results;
 
+    // figure out how many inversions have already been found, then continue enumerating
     size_t inversions = hamming(start_value, input[0]);
     EnumerateSlave(start_value, inversions, startbitpos, l, d, n, input, results);
 
@@ -91,38 +93,46 @@ void worker_main()
     }
     MPI_Recv(&master_depth, 1, MPI_UNSIGNED, MASTER, TAG_PARAMETER, COM, &status);
 
+    // 2.) while the master is sending work:
+    //      a) receive subproblems
+    //      b) locally solve (using findmotifs_worker(...))
+    //      c) send results to master
     bool master_active = true;
     std::deque<bits_t> assignments;
     while(master_active)
     {
+        // initiate receive
+        MPI_Request request;
         MPI_Status status;
         bits_t element;
-        MPI_Recv(&element, 1, MPI_UINT64_T, MASTER, MPI_ANY_TAG, COM, &status);
-        if (status.MPI_TAG == TAG_TASK)
-        {
-            assignments.push_back(element);
-        }
-        else if (status.MPI_TAG == TAG_FINISHED)
-        {
-            master_active = false;
-        }
+        MPI_Irecv(&element, 1, MPI_UINT64_T, MASTER, MPI_ANY_TAG, COM, &request);
+        std::cerr << "calling irecv" << std::endl;
 
         // if we have any assignments, solve one and return results
         if (!assignments.empty())
         {
             bits_t task = assignments.front();
             assignments.pop_front();
+            std::cerr << "solving problem: " << task << std::endl;
             std::vector<bits_t> solutions = findmotifs_worker(n, l, d, input.data(), master_depth, task);
-            for (size_t i = 0; i < solutions.size(); ++i)
-                std::cerr << "[worker] found solution: " << solutions.at(i) << std::endl;
+            MPI_Send(solutions.data(), solutions.size(), MPI_UINT64_T, MASTER, TAG_RESULT, COM);
         }
-    }
-    std::cerr << "[worker] wrapping things up!" << std::endl;
-    // 2.) while the master is sending work:
-    //      a) receive subproblems
-    //      b) locally solve (using findmotifs_worker(...))
-    //      c) send results to master
 
+        // finalize receive 
+        std::cerr << "calling wait" << std::endl;
+        MPI_Wait(&request, &status);
+        if (status.MPI_TAG == TAG_TASK)
+        {
+            std::cerr << "pushing new task: " << std::bitset<64>(element) << std::endl;
+            assignments.push_back(element);
+        }
+        else if (status.MPI_TAG == TAG_FINISHED)
+        {
+            std::cerr << "terminating" << std::endl;
+            master_active = false;
+        }
+
+   }
     // 3.) you have to figure out a communication protocoll:
     //     - how does the master tell the workers that no more work will come?
     //       (i.e., when to break loop 2)
@@ -131,32 +141,46 @@ void worker_main()
 
 int processors;
 
-void AssignTask(bits_t element)
+void AssignTask(bits_t element, std::vector<bits_t>& solutions)
 {
     static size_t slave_id = 0;
 
-    std::cerr << "[master] assigning task " << std::bitset<64>(element) << " to processor " << slave_id + 1 << std::endl;
+    // send the task to a worker
+    std::cerr << "[master] sending element" << std::endl;
     MPI_Send(&element, 1, MPI_UINT64_T, slave_id + 1, TAG_TASK, COM);
+
+    // receive the solutions (if any) from a worker
+    std::cerr << "[master] waiting for solutions" << std::endl;
+    MPI_Status status;
+    MPI_Probe(slave_id + 1, TAG_RESULT, COM, &status);
+    int buffer_size;
+    std::cerr << "[master] there are " << buffer_size << " solutions" << std::endl;
+    MPI_Get_count(&status, MPI_UINT64_T, &buffer_size);
+    bits_t* buffer = (bits_t*)malloc(sizeof(bits_t) * buffer_size);
+    MPI_Recv(buffer, buffer_size, MPI_UINT64_T, slave_id + 1, TAG_RESULT, COM, MPI_STATUS_IGNORE);
+    for (int i = 0; i < buffer_size; ++i)
+        solutions.push_back(buffer[i]);
+    free(buffer);
 
     // find next slave, there are (p-1) slaves
     slave_id = (slave_id + 1) % (processors - 1);
 }
 
-void EnumerateMaster(bits_t element, size_t inversions, size_t position, const size_t k, const size_t d)
+void EnumerateMaster(bits_t element, size_t inversions, size_t position, const size_t k, const size_t d, std::vector<bits_t>& solutions)
 {
     // if we have reached our k-depth for the master, send task to worker
     if (position == k)
     {
-        AssignTask(element);
+        AssignTask(element, solutions);
         return;
     }
 
     // enumerate candidate and inversion candidate
-    EnumerateMaster(element, inversions, position + 1, k, d);
+    EnumerateMaster(element, inversions, position + 1, k, d, solutions);
     if (inversions < d)
     {
         bits_t element_ = InvertBit(element, position);
-        EnumerateMaster(element_, inversions + 1, position + 1, k, d);
+        EnumerateMaster(element_, inversions + 1, position + 1, k, d, solutions);
     }
 }
 
@@ -170,7 +194,7 @@ std::vector<bits_t> findmotifs_master(const unsigned int n,
 
     // recursively search for solutions
     bits_t base = input[0];
-    EnumerateMaster(base, 0, 0, till_depth, d);
+    EnumerateMaster(base, 0, 0, till_depth, d, results);
     
     return results;
 }
@@ -184,7 +208,6 @@ std::vector<bits_t> master_main(unsigned int n, unsigned int l, unsigned int d,
     // 1.) send input to all workers (including n, l, d, input, depth)
     for (int i = 1; i < processors; ++i)
     {
-        std::cerr << "[MASTER] communicating with slave #" << i << std::endl;
         MPI_Request request;
         MPI_Isend(&n, 1, MPI_UNSIGNED, i, TAG_PARAMETER, COM, &request);
         MPI_Isend(&l, 1, MPI_UNSIGNED, i, TAG_PARAMETER, COM, &request);
@@ -200,22 +223,17 @@ std::vector<bits_t> master_main(unsigned int n, unsigned int l, unsigned int d,
     // 2.) solve problem till depth `master_depth` and then send subproblems
     //     to the workers and receive solutions in each communication
     //     Use your implementation of `findmotifs_master(...)` here.
-    findmotifs_master(n, l, d, input, master_depth);
+    std::vector<bits_t> results = findmotifs_master(n, l, d, input, master_depth);
 
-    // notify all workers that we are finished
+    // 3.) receive last round of solutions TODO
+    
+    // 4.) terminate (and let the workers know)
     for (int i = 1; i < processors; ++i)
     {
         MPI_Request request;
         uint64_t nothing = 0;
         MPI_Isend(&nothing, 1, MPI_UINT64_T, i, TAG_FINISHED, COM, &request);
     }
-
-    std::cerr << "[master] finished enumerating solutions, finished notifying workers that done" << std::endl;
-    std::vector<bits_t> results;
-
-    // 3.) receive last round of solutions
-    // TODO receive all solutions, and finished messages, then terminate
-    // 4.) terminate (and let the workers know)
 
     return results;
 }
