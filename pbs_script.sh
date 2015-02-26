@@ -35,7 +35,7 @@ EXE=$PBS_O_WORKDIR/findmotifs
 # loop over number of processors (just an example, uncomment to use the loop)
 # for p in 2 4 8 12 16 24
 # do
-p=2
+p=8
 #OMPI_MCA_mpi_yield_when_idle=0 mpirun --hostfile $PBS_NODEFILE -np $p $EXE $MASTER_DEPTH $INPUT_FILE $OUTPUT_FILE
 OMPI_MCA_mpi_yield_when_idle=0 mpirun -np $p $EXE $MASTER_DEPTH $INPUT_FILE $OUTPUT_FILE
 # done
