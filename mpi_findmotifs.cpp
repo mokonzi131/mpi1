@@ -106,29 +106,24 @@ void worker_main()
         MPI_Status status;
         bits_t element;
         MPI_Irecv(&element, 1, MPI_UINT64_T, MASTER, MPI_ANY_TAG, COM, &request);
-        std::cerr << "calling irecv" << std::endl;
 
         // if we have any assignments, solve one and return results
         if (!assignments.empty())
         {
             bits_t task = assignments.front();
             assignments.pop_front();
-            std::cerr << "solving problem: " << task << std::endl;
             std::vector<bits_t> solutions = findmotifs_worker(n, l, d, input.data(), master_depth, task);
             MPI_Send(solutions.data(), solutions.size(), MPI_UINT64_T, MASTER, TAG_RESULT, COM);
         }
 
         // finalize receive 
-        std::cerr << "calling wait" << std::endl;
         MPI_Wait(&request, &status);
         if (status.MPI_TAG == TAG_TASK)
         {
-            std::cerr << "pushing new task: " << std::bitset<64>(element) << std::endl;
             assignments.push_back(element);
         }
         else if (status.MPI_TAG == TAG_FINISHED)
         {
-            std::cerr << "terminating" << std::endl;
             master_active = false;
         }
 
@@ -144,23 +139,26 @@ int processors;
 void AssignTask(bits_t element, std::vector<bits_t>& solutions)
 {
     static size_t slave_id = 0;
+    static int sent_messages = 0;
+
+    // if we have sent at least one task to every worker, we start receiving before the next send
+    if (sent_messages > processors - 1)
+    {
+        // receive solutions (if any) from the worker
+        MPI_Status status;
+        MPI_Probe(slave_id + 1, TAG_RESULT, COM, &status);
+        int buffer_size;
+        MPI_Get_count(&status, MPI_UINT64_T, &buffer_size);
+        bits_t* buffer = (bits_t*)malloc(sizeof(bits_t) * buffer_size);
+        MPI_Recv(buffer, buffer_size, MPI_UINT64_T, slave_id + 1, TAG_RESULT, COM, MPI_STATUS_IGNORE);
+        for (int i = 0; i < buffer_size; ++i)
+            solutions.push_back(buffer[i]);
+        free(buffer);
+    }
 
     // send the task to a worker
-    std::cerr << "[master] sending element" << std::endl;
     MPI_Send(&element, 1, MPI_UINT64_T, slave_id + 1, TAG_TASK, COM);
-
-    // receive the solutions (if any) from a worker
-    std::cerr << "[master] waiting for solutions" << std::endl;
-    MPI_Status status;
-    MPI_Probe(slave_id + 1, TAG_RESULT, COM, &status);
-    int buffer_size;
-    std::cerr << "[master] there are " << buffer_size << " solutions" << std::endl;
-    MPI_Get_count(&status, MPI_UINT64_T, &buffer_size);
-    bits_t* buffer = (bits_t*)malloc(sizeof(bits_t) * buffer_size);
-    MPI_Recv(buffer, buffer_size, MPI_UINT64_T, slave_id + 1, TAG_RESULT, COM, MPI_STATUS_IGNORE);
-    for (int i = 0; i < buffer_size; ++i)
-        solutions.push_back(buffer[i]);
-    free(buffer);
+    ++sent_messages;
 
     // find next slave, there are (p-1) slaves
     slave_id = (slave_id + 1) % (processors - 1);
@@ -225,11 +223,21 @@ std::vector<bits_t> master_main(unsigned int n, unsigned int l, unsigned int d,
     //     Use your implementation of `findmotifs_master(...)` here.
     std::vector<bits_t> results = findmotifs_master(n, l, d, input, master_depth);
 
-    // 3.) receive last round of solutions TODO
-    
     // 4.) terminate (and let the workers know)
     for (int i = 1; i < processors; ++i)
     {
+        // 3.) receive last round of solutions
+        MPI_Status status;
+        MPI_Probe(i, TAG_RESULT, COM, &status);
+        int buffer_size;
+        MPI_Get_count(&status, MPI_UINT64_T, &buffer_size);
+        bits_t* buffer = (bits_t*)malloc(sizeof(bits_t) * buffer_size);
+        MPI_Recv(buffer, buffer_size, MPI_UINT64_T, i, TAG_RESULT, COM, MPI_STATUS_IGNORE);
+        for (int j = 0; j < buffer_size; ++j)
+            results.push_back(buffer[j]);
+        free(buffer);
+
+        // 4.) terminate (and let the workers know)
         MPI_Request request;
         uint64_t nothing = 0;
         MPI_Isend(&nothing, 1, MPI_UINT64_T, i, TAG_FINISHED, COM, &request);
